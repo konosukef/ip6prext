@@ -1,0 +1,126 @@
+#!/bin/sh
+# Copyright (c) 2021 Konosuke Furuhata <konosuke@furuhata.jp>
+# Licensed under the MIT License.
+
+readonly EXCLUDED_INTERFACE=""	# Interfaces to be excluded from prefix extend
+readonly NDPPD_ENABLE="0"	# Enable/disable NDP (NS/NA) proxy for ndppd
+readonly NDPPD_CONF_FILE=""	# Make a temporary file by default
+readonly AUTOWIRE="0"
+readonly IP_PATH="ip"
+readonly NDPPD_PATH="ndppd"
+readonly AUTOWIRE_PATH="autowire.sh"
+
+. /lib/functions/network.sh
+
+log() {
+	logger -t ip6prext -p "user.${2:-notice}" "$1"
+}
+
+enable_ndppd() {
+	local interface="$1"
+	local iface_interfaces="${*/$1}"
+	local conf_file="${NDPPD_CONF_FILE:-/tmp/ndppd.conf}"
+
+	[ "${NDPPD_ENABLE:-0}" -gt 0 ] || {
+		grep -qw "proxy $interface" "$conf_file" 2>/dev/null || return 0
+		sed -i '/^proxy '$interface' {$/,/^}$/d' "$conf_file" &&
+			log "Removed proxy section for $interface in $conf_file"
+		return
+	}
+
+	which "$NDPPD_PATH" >/dev/null || {
+		log "Missing or invalid path '$NDPPD_PATH'" err
+		return 1
+	}
+
+	grep -qw "proxy $interface" "$conf_file" 2>/dev/null && return
+	log "Writing proxy section for $interface in $conf_file"
+	echo -ne "proxy $interface {\n" >> "$conf_file" || return
+	echo -ne "   router no\n" >> "$conf_file"
+	local iface_interface
+	for iface_interface in $iface_interfaces; do
+		echo -ne "   rule ::/0 {\n" >> "$conf_file"
+		echo -ne "      iface $iface_interface\n" >> "$conf_file"
+		echo -ne "   }\n" >> "$conf_file"
+	done
+	echo -ne "}\n" >> "$conf_file"
+
+	log "Restarting ndppd to enable NDP proxy on $interface"
+	[ -f /var/run/ndppd.pid ] && kill $(cat /var/run/ndppd.pid)
+	"$NDPPD_PATH" -c "$conf_file" -p /var/run/ndppd.pid -d || {
+		log "Failed to restart ndppd" err
+		sed -i '/^proxy '$interface' {$/,/^}$/d' "$conf_file"
+		return 1
+	}
+}
+
+if [ "$ACTION" = ifup -o "$ACTION" = ifupdate ]; then
+	which "$IP_PATH" >/dev/null || {
+		log "Missing or invalid path '$IP_PATH'" err
+		exit 1
+	}
+
+	for i in $(seq 3); do
+		network_flush_cache
+		network_find_wan wan_iface
+		network_find_wan6 wan6_iface && break
+		sleep 5
+	done
+	[ "$wan6_iface" ] || {
+		log "Could not find wan6 interface" err
+		exit 1
+	}
+
+	__network_ifstatus up_ifaces "" "[@.up=true].interface"
+	for up_iface in $up_ifaces; do
+		echo "$EXCLUDED_INTERFACE $wan_iface $wan6_iface loopback" |
+			grep -qw "$up_iface" && continue
+		ifaces="${ifaces:+$ifaces }$up_iface"
+	done
+
+	[ "$INTERFACE" = "$wan6_iface" ] && {
+		for iface in $ifaces; do
+			network_get_device device "$iface" || continue
+			for addr in $(cat /var/run/ip6prext.addrs 2>/dev/null); do
+				"$IP_PATH" -6 addr del "$addr" dev "$device" 2>/dev/null &&
+					log "Deleted $addr on $iface ($device)"
+			done
+		done
+	}
+
+	__network_ifstatus addrs "$wan6_iface" "['ipv6-address'][@.mask=64]['address','mask']" "/ " ||
+		__network_ifstatus addrs "$wan6_iface" ".route[@.target='::'].source"
+	if echo "$addrs" | grep -q "/64"; then
+		echo "$addrs" > /var/run/ip6prext.addrs
+	else
+		unset addrs
+		log "$wan6_iface does not have an IPv6 address with a /64" err
+	fi
+
+	network_get_device wan6_device "$wan6_iface"
+	devices="$wan6_device"
+	mtu=$(cat /proc/sys/net/ipv6/conf/$wan6_device/mtu)
+
+	for addr in $addrs; do
+		"$IP_PATH" -6 route flush "$addr" dev "$wan6_device"
+	done
+
+	for iface in $ifaces; do
+		network_get_device device "$iface" || continue
+		devices="$devices $device"
+		echo "${mtu:-1280}" > "/proc/sys/net/ipv6/conf/$device/mtu"
+		for addr in $addrs; do
+			"$IP_PATH" -6 addr add "$addr" dev "$device" 2>/dev/null &&
+				log "Added $addr to $iface ($device)"
+		done
+	done
+
+	for device in $devices; do
+		enable_ndppd $device ${devices/$device} || exit
+	done
+
+	if [ "${AUTOWIRE:-0}" -gt 0 ]; then
+		pgrep -f "$AUTOWIRE_PATH" >/dev/null ||
+			"$AUTOWIRE_PATH" $devices &
+	fi
+fi
