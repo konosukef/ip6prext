@@ -105,9 +105,11 @@ if [ "$ACTION" = ifup -o "$ACTION" = ifupdate ]; then
 		"$IP_PATH" -6 route flush "$addr" dev "$wan6_device"
 	done
 
+	__network_ifstatus pd_iface "$wan6_iface" "['ipv6-prefix'][0].assigned"
 	for iface in $ifaces; do
 		network_get_device device "$iface" || continue
 		devices="$devices $device"
+		echo "$pd_iface" | grep -qw "$iface" && continue
 		echo "${mtu:-1280}" > "/proc/sys/net/ipv6/conf/$device/mtu"
 		for addr in $addrs; do
 			"$IP_PATH" -6 addr add "$addr" dev "$device" 2>/dev/null &&
