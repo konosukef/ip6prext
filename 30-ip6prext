@@ -2,7 +2,7 @@
 # Copyright (c) 2021 Konosuke Furuhata <konosuke@furuhata.jp>
 # Licensed under the MIT License.
 
-readonly EXCLUDED_INTERFACE=""	# Interfaces to be excluded from prefix extend
+readonly EXCLUDE_INTERFACES=""	# Interfaces to be exclude from prefix extend
 readonly NDPPD_ENABLE="0"	# Enable/disable NDP (NS/NA) proxy for ndppd
 readonly NDPPD_CONF_FILE=""	# Make a temporary file by default
 readonly AUTOWIRE="0"
@@ -20,6 +20,7 @@ enable_ndppd() {
 	local interface="$1"
 	local iface_interfaces="${*/$1}"
 	local conf_file="${NDPPD_CONF_FILE:-/tmp/ndppd.conf}"
+	local pid_file="/var/run/ndppd.pid"
 
 	[ "${NDPPD_ENABLE:-0}" -gt 0 ] || {
 		grep -qw "proxy $interface" "$conf_file" 2>/dev/null || return 0
@@ -46,8 +47,8 @@ enable_ndppd() {
 	echo -ne "}\n" >> "$conf_file"
 
 	log "Restarting ndppd to enable NDP proxy on $interface"
-	[ -f /var/run/ndppd.pid ] && kill $(cat /var/run/ndppd.pid)
-	"$NDPPD_PATH" -c "$conf_file" -p /var/run/ndppd.pid -d || {
+	[ -f "$pid_file" ] && kill $(cat "$pid_file")
+	"$NDPPD_PATH" -c "$conf_file" -p "$pid_file" -d || {
 		log "Failed to restart ndppd" err
 		sed -i '/^proxy '$interface' {$/,/^}$/d' "$conf_file"
 		return 1
@@ -68,30 +69,30 @@ if [ "$ACTION" = ifup -o "$ACTION" = ifupdate ]; then
 	done
 	[ "$wan6_iface" ] || {
 		log "Could not find wan6 interface" err
-		exit 1
+		[ "$WAN6_INTERFACE" ] || exit
 	}
 
 	__network_ifstatus up_ifaces "" "[@.up=true].interface"
 	for up_iface in $up_ifaces; do
-		echo "$EXCLUDED_INTERFACE $wan_iface $wan6_iface loopback" |
+		echo "loopback $wan_iface $wan6_iface $WAN6_INTERFACE $EXCLUDE_INTERFACES" |
 			grep -qw "$up_iface" && continue
 		ifaces="${ifaces:+$ifaces }$up_iface"
 	done
 
-	[ "$INTERFACE" = "$wan6_iface" ] && {
-		for iface in $ifaces; do
-			network_get_device device "$iface" || continue
-			for addr in $(cat /var/run/ip6prext.addrs 2>/dev/null); do
-				"$IP_PATH" -6 addr del "$addr" dev "$device" 2>/dev/null &&
-					log "Deleted $addr on $iface ($device)"
-			done
+	[ "$WAN6_INTERFACE" ] && wan6_iface="$WAN6_INTERFACE"
+
+	for iface in $ifaces; do
+		network_get_device device "$iface" || continue
+		for addr in $(cat "/var/run/ip6prext.$INTERFACE.addrs" 2>/dev/null); do
+			"$IP_PATH" -6 addr del "$addr" dev "$device" 2>/dev/null &&
+				log "Deleted $addr on $iface ($device)"
 		done
-	}
+	done
 
 	__network_ifstatus addrs "$wan6_iface" "['ipv6-address'][@.mask=64]['address','mask']" "/ " ||
 		__network_ifstatus addrs "$wan6_iface" ".route[@.target='::'].source"
 	if echo "$addrs" | grep -q "/64"; then
-		echo "$addrs" > /var/run/ip6prext.addrs
+		echo "$addrs" > "/var/run/ip6prext.$wan6_iface.addrs"
 	else
 		unset addrs
 		log "$wan6_iface does not have an IPv6 address with a /64" err
@@ -99,7 +100,7 @@ if [ "$ACTION" = ifup -o "$ACTION" = ifupdate ]; then
 
 	network_get_device wan6_device "$wan6_iface"
 	devices="$wan6_device"
-	mtu=$(cat /proc/sys/net/ipv6/conf/$wan6_device/mtu)
+	mtu=$(cat "/proc/sys/net/ipv6/conf/$wan6_device/mtu")
 
 	for addr in $addrs; do
 		"$IP_PATH" -6 route flush "$addr" dev "$wan6_device"
@@ -118,7 +119,7 @@ if [ "$ACTION" = ifup -o "$ACTION" = ifupdate ]; then
 	done
 
 	for device in $devices; do
-		enable_ndppd $device ${devices/$device} || exit
+		enable_ndppd $device ${devices/$device} || break
 	done
 
 	if [ "${AUTOWIRE:-0}" -gt 0 ]; then
